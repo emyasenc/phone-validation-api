@@ -11,7 +11,7 @@ import logging
 from typing import Optional, List, Dict
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Query, Request, Depends, Header, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -67,28 +67,8 @@ app.add_middleware(
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["X-RapidAPI-Key", "X-RapidAPI-Host", "Content-Type"],
+    allow_headers=["*"],
 )
-
-# ============================================
-# RAPIDAPI AUTHENTICATION (No rate limiting)
-# ============================================
-
-def verify_rapidapi_key(x_rapidapi_key: Optional[str] = Header(None)):
-    """Verify that the request is coming through RapidAPI."""
-    if ENVIRONMENT == "development":
-        return {"tier": "development", "api_key": "dev"}
-    
-    if not x_rapidapi_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "error": "RAPIDAPI_REQUIRED",
-                "message": "This API must be accessed through RapidAPI."
-            }
-        )
-    
-    return {"tier": "authenticated", "api_key": x_rapidapi_key[:8] + "..."}
 
 # ============================================
 # HELPER FUNCTIONS
@@ -216,7 +196,7 @@ def health():
     }
 
 # ============================================
-# PROTECTED ENDPOINTS (No rate limiting)
+# PROTECTED ENDPOINTS (No authentication needed - RapidAPI handles it)
 # ============================================
 
 @app.get("/validate")
@@ -224,17 +204,16 @@ def validate_phone(
     phone: str = Query(..., description="Phone number with country code (e.g., +14155552671)"),
     include_carrier: bool = Query(True),
     include_timezone: bool = Query(True),
-    include_location: bool = Query(True),
-    api_key_info: dict = Depends(verify_rapidapi_key)
+    include_location: bool = Query(True)
 ):
     """Validate a single phone number."""
-    api_key = api_key_info.get("api_key", "unknown")
-    tier = api_key_info.get("tier", "free")
+    api_key = "rapidapi_user"
+    tier = "free"
     
     try:
         result = validate_phone_logic(phone, include_carrier, include_timezone, include_location)
         tracker.increment(api_key, tier)
-        logger.info(f"Validation successful for {phone[:10]}... via {api_key}")
+        logger.info(f"Validation successful for {phone[:10]}...")
         return JSONResponse(content=result)
         
     except NumberParseException as e:
@@ -254,11 +233,10 @@ def validate_batch(
     phones: List[str],
     include_carrier: bool = True,
     include_timezone: bool = True,
-    include_location: bool = True,
-    api_key_info: dict = Depends(verify_rapidapi_key)
+    include_location: bool = True
 ):
     """Validate up to 100 phone numbers in one request."""
-    api_key = api_key_info.get("api_key", "unknown")
+    api_key = "rapidapi_user"
     
     if len(phones) > 100:
         raise HTTPException(
@@ -315,7 +293,7 @@ def validate_batch(
         results.append(result)
     
     tracker.increment(api_key, "business", len(phones))
-    logger.info(f"Batch validation: {valid_count}/{len(phones)} valid via {api_key}")
+    logger.info(f"Batch validation: {valid_count}/{len(phones)} valid")
     
     return {
         "total": len(results),
@@ -329,31 +307,27 @@ async def bulk_upload(
     file: UploadFile = File(...),
     include_carrier: bool = Form(True),
     include_timezone: bool = Form(True),
-    include_location: bool = Form(True),
-    api_key_info: dict = Depends(verify_rapidapi_key)
+    include_location: bool = Form(True)
 ):
     """Upload CSV file for bulk phone validation."""
-    api_key = api_key_info.get("api_key", "unknown")
+    api_key = "rapidapi_user"
     
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported")
     
     result = await process_bulk_csv(file, lambda p, c, t, l: validate_phone_logic(p, c, t, l))
     tracker.increment(api_key, "enterprise", count=result.get("total", 0))
-    logger.info(f"Bulk upload processed {result.get('total', 0)} numbers via {api_key}")
+    logger.info(f"Bulk upload processed {result.get('total', 0)} numbers")
     
     return result
 
 @app.get("/usage")
-def get_usage(api_key_info: dict = Depends(verify_rapidapi_key)):
-    api_key = api_key_info.get("api_key", "unknown")
+def get_usage():
+    api_key = "rapidapi_user"
     return tracker.get_usage(api_key)
 
 @app.post("/webhooks/register")
-async def register_webhook(
-    request: Request,
-    api_key_info: dict = Depends(verify_rapidapi_key)
-):
+async def register_webhook(request: Request):
     """Register a webhook URL for notifications."""
     try:
         body = await request.json()
@@ -363,23 +337,23 @@ async def register_webhook(
         if not url:
             raise HTTPException(status_code=400, detail="url is required")
         
-        api_key = api_key_info.get("api_key", "unknown")
+        api_key = "rapidapi_user"
         return webhook_manager.register(api_key, url, events)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/webhooks")
-def get_webhooks(api_key_info: dict = Depends(verify_rapidapi_key)):
-    api_key = api_key_info.get("api_key", "unknown")
+def get_webhooks():
+    api_key = "rapidapi_user"
     return {"webhooks": webhook_manager.get_webhooks(api_key)}
 
 @app.delete("/webhooks/{webhook_id}")
-def delete_webhook(webhook_id: str, api_key_info: dict = Depends(verify_rapidapi_key)):
-    api_key = api_key_info.get("api_key", "unknown")
+def delete_webhook(webhook_id: str):
+    api_key = "rapidapi_user"
     return webhook_manager.delete(api_key, webhook_id)
 
 @app.get("/stats")
-def stats(api_key_info: dict = Depends(verify_rapidapi_key)):
+def stats():
     return {
         "service": "YASEN-ALPHA Phone Validation API",
         "version": "2.0.0",
