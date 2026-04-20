@@ -1,7 +1,6 @@
 """
 Phone Validation API - Enterprise Edition
 Copyright (c) YASEN-ALPHA
-DO NOT RUN THIS FILE DIRECTLY. Use via RapidAPI or with valid API key.
 """
 
 import os
@@ -11,7 +10,6 @@ import io
 import logging
 from typing import Optional, List, Dict
 from datetime import datetime
-from functools import wraps
 
 from fastapi import FastAPI, HTTPException, Query, Request, Depends, Header, status, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -22,30 +20,14 @@ from phonenumbers import carrier, timezone, geocoder
 from phonenumbers.phonenumberutil import NumberParseException
 import uvicorn
 
-# Enterprise modules
 from core.usage_tracker import tracker
 from core.webhooks import webhook_manager
 
 # ============================================
-# CONFIGURATION - Read from environment
+# CONFIGURATION
 # ============================================
 
-RAPIDAPI_SECRET = os.environ.get("RAPIDAPI_SECRET", "your-secret-here")
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
-
-RATE_LIMITS = {
-    "free": 10,
-    "pro": 100,
-    "business": 500,
-    "enterprise": 2000
-}
-
-MONTHLY_LIMITS = {
-    "free": 1500,
-    "pro": 10000,
-    "business": 50000,
-    "enterprise": 500000
-}
 
 # ============================================
 # LOGGING SETUP
@@ -89,7 +71,7 @@ app.add_middleware(
 )
 
 # ============================================
-# RAPIDAPI AUTHENTICATION
+# RAPIDAPI AUTHENTICATION (No rate limiting)
 # ============================================
 
 def verify_rapidapi_key(x_rapidapi_key: Optional[str] = Header(None)):
@@ -102,35 +84,11 @@ def verify_rapidapi_key(x_rapidapi_key: Optional[str] = Header(None)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
                 "error": "RAPIDAPI_REQUIRED",
-                "message": "This API must be accessed through RapidAPI.",
-                "docs": "https://rapidapi.com/.../docs"
+                "message": "This API must be accessed through RapidAPI."
             }
         )
     
     return {"tier": "authenticated", "api_key": x_rapidapi_key[:8] + "..."}
-
-# ============================================
-# RATE LIMITING
-# ============================================
-
-request_counts: Dict[str, List[datetime]] = {}
-
-def check_rate_limit(api_key: str, tier: str = "free") -> bool:
-    """Simple in-memory rate limiter."""
-    now = datetime.now()
-    minute_ago = now.replace(minute=now.minute - 1) if now.minute > 0 else now
-    
-    if api_key not in request_counts:
-        request_counts[api_key] = []
-    
-    request_counts[api_key] = [ts for ts in request_counts[api_key] if ts > minute_ago]
-    limit = RATE_LIMITS.get(tier, 10)
-    
-    if len(request_counts[api_key]) >= limit:
-        return False
-    
-    request_counts[api_key].append(now)
-    return True
 
 # ============================================
 # HELPER FUNCTIONS
@@ -184,7 +142,6 @@ async def process_bulk_csv(file: UploadFile, validate_func) -> Dict:
     text = content.decode('utf-8')
     csv_reader = csv.DictReader(io.StringIO(text))
     
-    # Find phone column
     fieldnames = csv_reader.fieldnames or []
     phone_column = None
     for col in fieldnames:
@@ -259,7 +216,7 @@ def health():
     }
 
 # ============================================
-# PROTECTED ENDPOINTS
+# PROTECTED ENDPOINTS (No rate limiting)
 # ============================================
 
 @app.get("/validate")
@@ -273,12 +230,6 @@ def validate_phone(
     """Validate a single phone number."""
     api_key = api_key_info.get("api_key", "unknown")
     tier = api_key_info.get("tier", "free")
-    
-    if not check_rate_limit(api_key, tier):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={"error": "RATE_LIMIT_EXCEEDED", "message": "Rate limit exceeded. Upgrade your plan."}
-        )
     
     try:
         result = validate_phone_logic(phone, include_carrier, include_timezone, include_location)
@@ -309,28 +260,17 @@ def validate_batch(
     """Validate up to 100 phone numbers in one request."""
     api_key = api_key_info.get("api_key", "unknown")
     
-    # Rate limiting
-    if not check_rate_limit(api_key, tier="business"):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded. Upgrade your plan."
-        )
-    
-    # Limit check
     if len(phones) > 100:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Maximum 100 phone numbers per batch request"
         )
     
-    # Process each phone
     results = []
     valid_count = 0
     
     for phone in phones:
-        # Validate each phone individually
         try:
-            # Clean and parse
             cleaned = clean_phone_number(phone)
             parsed = phonenumbers.parse(cleaned, None)
             is_valid = phonenumbers.is_valid_number(parsed)
@@ -345,7 +285,6 @@ def validate_batch(
                 "national_number": str(parsed.national_number),
             }
             
-            # Add optional fields
             if include_carrier and is_valid:
                 try:
                     result["carrier"] = carrier.name_for_number(parsed, "en") or "Unknown"
@@ -368,22 +307,13 @@ def validate_batch(
             if is_valid:
                 valid_count += 1
                 
-        except phonenumbers.NumberParseException as e:
-            result = {
-                "phone": phone,
-                "valid": False,
-                "error": f"Invalid format: {str(e)}"
-            }
+        except NumberParseException as e:
+            result = {"phone": phone, "valid": False, "error": f"Invalid format: {str(e)}"}
         except Exception as e:
-            result = {
-                "phone": phone,
-                "valid": False,
-                "error": f"Validation error: {str(e)}"
-            }
+            result = {"phone": phone, "valid": False, "error": f"Validation error: {str(e)}"}
         
         results.append(result)
     
-    # Track usage
     tracker.increment(api_key, "business", len(phones))
     logger.info(f"Batch validation: {valid_count}/{len(phones)} valid via {api_key}")
     
@@ -404,12 +334,6 @@ async def bulk_upload(
 ):
     """Upload CSV file for bulk phone validation."""
     api_key = api_key_info.get("api_key", "unknown")
-    
-    if not check_rate_limit(api_key, tier="enterprise"):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Bulk upload rate limit exceeded. Upgrade to enterprise plan."
-        )
     
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported")
