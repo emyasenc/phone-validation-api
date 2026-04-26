@@ -386,11 +386,6 @@ async def bulk_upload(
     
     return result
 
-@app.get("/usage")
-def get_usage():
-    api_key = "rapidapi_user"
-    return tracker.get_usage(api_key)
-
 @app.post("/webhooks/register")
 async def register_webhook(request: Request):
     """Register a webhook URL for notifications."""
@@ -422,11 +417,9 @@ def stats():
     return {
         "service": "YASEN-ALPHA Phone Validation API",
         "version": "2.0.0",
-        "uptime_30d": "99.95%",
-        "average_response_ms": 42,
         "countries_supported": "200+",
-        "carrier_coverage": "98%",
-        "last_updated": "2026-04-20"
+        "carrier_coverage": "Varies by country",
+        "last_updated": "2026-04-26"
     }
 
 @app.get("/legal/gdpr")
