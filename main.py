@@ -7,12 +7,16 @@ import os
 import re
 import csv
 import io
+import json
 import logging
 from typing import Optional, List, Dict
 from datetime import datetime
 from functools import lru_cache
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
+import time
+import threading
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form, status
 from fastapi.responses import JSONResponse
@@ -34,6 +38,33 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 
 # Thread pool for parallel processing
 executor = ThreadPoolExecutor(max_workers=4)
+
+# ============================================
+# RATE LIMITING (Added for production protection)
+# ============================================
+
+class SimpleRateLimiter:
+    """Simple in-memory rate limiter"""
+    def __init__(self):
+        self.requests = defaultdict(list)
+        self.lock = threading.Lock()
+    
+    def check_rate_limit(self, key: str, limit: int, window: int) -> bool:
+        """Check if rate limit is exceeded"""
+        now = time.time()
+        with self.lock:
+            # Clean old requests
+            self.requests[key] = [t for t in self.requests[key] if now - t < window]
+            
+            # Check limit
+            if len(self.requests[key]) >= limit:
+                return False
+            
+            # Add current request
+            self.requests[key].append(now)
+            return True
+
+rate_limiter = SimpleRateLimiter()
 
 # ============================================
 # LOGGING SETUP
@@ -90,18 +121,43 @@ app.add_middleware(
 )
 
 # ============================================
-# HELPER FUNCTIONS WITH CACHING
+# MIDDLEWARE: Rate Limiting
+# ============================================
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Apply rate limiting to all requests."""
+    # Get client identifier (API key or IP)
+    api_key = request.headers.get("X-API-Key") or request.headers.get("X-RapidAPI-Key")
+    client_id = api_key or request.client.host if request.client else "unknown"
+    
+    # Different limits based on environment
+    if ENVIRONMENT == "production":
+        limit = 100  # 100 requests per minute in production
+    else:
+        limit = 1000  # 1000 requests per minute in development
+    
+    if not rate_limiter.check_rate_limit(client_id, limit, 60):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Rate limit exceeded", "message": "Too many requests. Please wait and try again."}
+        )
+    
+    response = await call_next(request)
+    return response
+
+# ============================================
+# HELPER FUNCTIONS WITH CACHING (OPTIMIZED)
 # ============================================
 
 def clean_phone_number(phone: str) -> str:
     """Remove all non-digit characters except +"""
     return re.sub(r'[^\d+]', '', phone)
 
-# LRU Cache for validation results (most frequent numbers will be cached)
-@lru_cache(maxsize=1000)
+# LRU Cache for validation results - INCREASED to 5000 for better performance
+@lru_cache(maxsize=5000)
 def cached_validate_phone(phone: str, include_carrier: bool, include_timezone: bool, include_location: bool) -> str:
     """Cached version of validation logic - returns JSON string for speed."""
-    import json
     try:
         cleaned = clean_phone_number(phone)
         parsed = phonenumbers.parse(cleaned, None)
@@ -150,7 +206,6 @@ def cached_validate_phone(phone: str, include_carrier: bool, include_timezone: b
 
 def validate_phone_logic(phone: str, include_carrier: bool, include_timezone: bool, include_location: bool) -> dict:
     """Core validation logic with caching support."""
-    import json
     cached_result = cached_validate_phone(phone, include_carrier, include_timezone, include_location)
     result = json.loads(cached_result)
     # If there's an error, raise it so the endpoint can handle it
@@ -257,6 +312,13 @@ async def validate_phone(
     api_key = "rapidapi_user"
     tier = "free"
     
+    # Rate limit by API key (per minute)
+    if not rate_limiter.check_rate_limit(api_key, 50, 60):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "RATE_LIMIT_EXCEEDED", "message": "Too many requests. Please wait and try again."}
+        )
+    
     # Basic validation before trying to parse
     if not phone or len(phone) < 2:
         raise HTTPException(
@@ -297,6 +359,13 @@ async def validate_batch(
 ):
     """Validate up to 100 phone numbers in one request - Parallel processing."""
     api_key = "rapidapi_user"
+    
+    # Rate limit by API key (per minute)
+    if not rate_limiter.check_rate_limit(api_key, 30, 60):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "RATE_LIMIT_EXCEEDED", "message": "Too many batch requests. Please wait and try again."}
+        )
     
     if len(phones) > 100:
         raise HTTPException(
@@ -376,6 +445,13 @@ async def bulk_upload(
 ):
     """Upload CSV file for bulk phone validation."""
     api_key = "rapidapi_user"
+    
+    # Rate limit for bulk upload (per minute)
+    if not rate_limiter.check_rate_limit(api_key, 10, 60):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "RATE_LIMIT_EXCEEDED", "message": "Too many bulk uploads. Please wait and try again."}
+        )
     
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported")

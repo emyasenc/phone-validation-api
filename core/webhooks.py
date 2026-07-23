@@ -1,91 +1,157 @@
 """
 Webhook system for enterprise customers.
-Sends HTTP POST notifications when invalid numbers are detected.
+Stores webhooks in SQLite for persistence across deploys.
 """
 
 import json
-import httpx
-from typing import Dict, List, Optional
+import sqlite3
+from typing import List, Dict, Optional
 from datetime import datetime
 import logging
 from pathlib import Path
+import httpx
+import asyncio
 
 logger = logging.getLogger(__name__)
 
-# Storage for registered webhooks
-WEBHOOK_FILE = Path("webhooks.json")
-
 class WebhookManager:
-    def __init__(self):
-        self._ensure_file_exists()
+    def __init__(self, db_path="webhooks.db"):
+        self.db_path = db_path
+        self._init_db()
     
-    def _ensure_file_exists(self):
-        if not WEBHOOK_FILE.exists():
-            WEBHOOK_FILE.write_text(json.dumps({}, indent=2))
+    def _init_db(self):
+        """Initialize the database with webhooks table."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS webhooks (
+                id TEXT PRIMARY KEY,
+                api_key TEXT,
+                url TEXT,
+                events TEXT,
+                created_at TIMESTAMP
+            )
+        """)
+        # Also create logs table for delivery tracking
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS webhook_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                webhook_id TEXT,
+                event TEXT,
+                status TEXT,
+                response_code INTEGER,
+                error TEXT,
+                created_at TIMESTAMP
+            )
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("✅ Webhook database initialized")
     
-    def _load_data(self) -> Dict:
-        try:
-            return json.loads(WEBHOOK_FILE.read_text())
-        except:
-            return {}
-    
-    def _save_data(self, data: Dict):
-        WEBHOOK_FILE.write_text(json.dumps(data, indent=2))
-    
-    def register(self, api_key: str, url: str, events: List[str] = None):
+    def register(self, api_key: str, url: str, events: List[str] = None) -> Dict:
         """Register a webhook URL for an API key"""
         if events is None:
             events = ["invalid_number", "rate_limit_exceeded"]
         
-        data = self._load_data()
-        if api_key not in data:
-            data[api_key] = []
-        
+        import secrets
         webhook_id = f"wh_{datetime.utcnow().timestamp()}"
-        data[api_key].append({
-            "id": webhook_id,
-            "url": url,
-            "events": events,
-            "created_at": datetime.utcnow().isoformat()
-        })
         
-        self._save_data(data)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO webhooks (id, api_key, url, events, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (webhook_id, api_key, url, json.dumps(events), datetime.utcnow().isoformat()))
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"✅ Webhook registered: {webhook_id} for {api_key}")
+        
         return {"webhook_id": webhook_id, "status": "registered"}
     
     def get_webhooks(self, api_key: str) -> List[Dict]:
         """Get all webhooks for an API key"""
-        data = self._load_data()
-        return data.get(api_key, [])
-    
-    def delete(self, api_key: str, webhook_id: str):
-        """Delete a webhook"""
-        data = self._load_data()
-        if api_key in data:
-            data[api_key] = [w for w in data[api_key] if w["id"] != webhook_id]
-            self._save_data(data)
-        return {"status": "deleted"}
-    
-    async def trigger(self, api_key: str, event: str, payload: Dict):
-        """Send webhook notification for an event"""
-        data = self._load_data()
-        webhooks = data.get(api_key, [])
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, url, events, created_at
+            FROM webhooks WHERE api_key = ?
+        """, (api_key,))
+        rows = cursor.fetchall()
+        conn.close()
         
-        for webhook in webhooks:
-            if event in webhook["events"]:
-                try:
-                    async with httpx.AsyncClient() as client:
-                        await client.post(
-                            webhook["url"],
-                            json={
-                                "event": event,
-                                "timestamp": datetime.utcnow().isoformat(),
-                                "data": payload,
-                                "api_key": api_key[:8] + "..."
-                            },
-                            timeout=5.0
-                        )
-                    logger.info(f"Webhook sent to {webhook['url']} for event {event}")
-                except Exception as e:
-                    logger.error(f"Webhook failed for {webhook['url']}: {str(e)}")
+        return [dict(row) for row in rows]
+    
+    def delete(self, api_key: str, webhook_id: str) -> Dict:
+        """Delete a webhook"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM webhooks
+            WHERE id = ? AND api_key = ?
+        """, (webhook_id, api_key))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        if deleted:
+            logger.info(f"✅ Webhook deleted: {webhook_id}")
+            return {"status": "deleted"}
+        return {"status": "not_found"}
+    
+    async def trigger(self, api_key: str, event: str, payload: Dict, max_retries: int = 3):
+        """Send webhook notification with retry logic."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, url FROM webhooks WHERE api_key = ?
+        """, (api_key,))
+        webhooks = cursor.fetchall()
+        conn.close()
+        
+        for webhook_id, url in webhooks:
+            success = await self._send_with_retry(url, event, payload, max_retries)
+            self._log_delivery(webhook_id, event, success)
+    
+    async def _send_with_retry(self, url: str, event: str, payload: Dict, max_retries: int = 3) -> bool:
+        """Send webhook with exponential backoff retry."""
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        url,
+                        json={
+                            "event": event,
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "data": payload
+                        },
+                        timeout=5.0
+                    )
+                    if response.status_code in [200, 201, 202, 204]:
+                        logger.info(f"✅ Webhook sent to {url} for event {event}")
+                        return True
+                    else:
+                        logger.warning(f"⚠️ Webhook returned {response.status_code} for {url}")
+            except Exception as e:
+                logger.warning(f"⚠️ Webhook attempt {attempt+1} failed: {e}")
+            
+            # Exponential backoff: 1s, 2s, 4s
+            await asyncio.sleep(2 ** attempt)
+        
+        logger.error(f"❌ Webhook failed after {max_retries} attempts for {url}")
+        return False
+    
+    def _log_delivery(self, webhook_id: str, event: str, success: bool):
+        """Log webhook delivery attempt."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO webhook_logs (webhook_id, event, status, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (webhook_id, event, "success" if success else "failed", datetime.utcnow().isoformat()))
+        conn.commit()
+        conn.close()
 
+# Create singleton instance
 webhook_manager = WebhookManager()
